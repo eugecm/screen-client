@@ -1,7 +1,7 @@
 # Based on the makefile from crosspack
 DEVICE		= atmega328
 PROGRAMMER	= -c stk500v2
-OBJECTS		= main.o
+OBJECTS		= main.o lcd.o nrf24.o
 # calculated using http://www.engbedded.com/fusecalc
 FUSES		= -U lfuse:w:0xe2:m -U hfuse:w:0xd9:m -U efuse:w:0xff:m 
 
@@ -44,3 +44,5 @@ disasm:	main.elf
 cpp:
 	$(COMPILE) -E main.c
 
+pull:
+	scp "workspace.eugenio.sh:/home/eugecm/src/screen-client/*" .

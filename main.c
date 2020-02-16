@@ -1,268 +1,119 @@
 #define F_CPU 8000000UL
 
-#include <alloca.h>
-#include <string.h>
+#include "lcd.h"
+#include "nrf24.h"
+
 #include <avr/cpufunc.h>
 #include <avr/io.h>
 #include <util/delay.h>
 
-#define NRF24_REG_CONFIG 0x00
-#define NRF24_REG_EN_AA 0x01
-#define NRF24_REG_EN_RXADDR 0x02
-#define NRF24_REG_SETUP_AW 0x03
-#define NRF24_REG_SETUP_RETR 0x04
-#define NRF24_REG_RF_CH 0x05
-#define NRF24_REG_RF_SETUP 0x06
-#define NRF24_REG_STATUS 0x07
-#define NRF24_REG_OBSERVE_TX 0x08
-#define NRF24_REG_RX_ADDR_P0 0x0A
-#define NRF24_REG_RX_PW_P0 0x11
-#define NRF24_REG_DYNPD 0x1C
-#define NRF24_REG_FEATURE 0x1D
+char SERVER_ADDR[5] = {0xAB, 0xAB, 0xAB, 0xAB, 0xAB};
+char* MSG = "HELLO";
 
-void init(void);
+void show_error(const char*);
 
-char nrf24_read_register(char);
-void nrf24_write_register(char, char);
-void nrf24_write_register_n(char, char*, int);
-char nrf24_read_payload_width(void);
-void nrf24_read_rx_payload(char*, int);
+void init(void) {
+    lcd_init();
+    nrf24_init(SERVER_ADDR);
 
-char int_to_hex(char);
+    /* Set unused ports as input with pull-up resistors */
+    DDRC = 0; PORTC = 0xFF;
 
-char* RX_ADDRESS = "ABABA";
+    /* NOP used for synchronization */
+    _NOP();
+}
 
-int main(void)
-{
-    char data;
+int main(void) {
+    char buf;
+    /* We make recv size 33 to append a \0 in case sender uses full 32 bytes*/
+    char recv[33];
+    char cfg;
+    char status;
 
     init();
-    lcd_init();
 
-    lcd_clear_and_home();
+    nrf24_send_command(NRF24_CMD_R_REGISTER | NRF24_REG_CONFIG, 0, 0, &cfg, 1);
+    nrf24_send_command(NRF24_CMD_R_REGISTER | NRF24_REG_STATUS, 0, 0, &status, 1);
 
-    // read STATUS
-    data = nrf24_read_register(0x07);
-    lcd_print_text("STATUS=");
-    lcd_print_byte(data);
+    /* Power up and standby-I */
+    cfg = cfg | 0b00000010;
+    nrf24_send_command(NRF24_CMD_W_REGISTER | NRF24_REG_CONFIG, &cfg, 1, 0, 0);
+    _delay_ms(3);
 
+    lcd_print_byte(cfg);
     lcd_move_second_line();
+    lcd_print_byte(status);
 
-    // read CONFIG
-    data = nrf24_read_register(0x00);
-    lcd_print_text("CONFIG=");
-    lcd_print_byte(data);
-
-    // Making sure CE is low
-    PORTB &= ~(1<<PB1);
     _delay_ms(1000);
 
-    // Configure RX mode
-    {
-	// Make active RX (PRIM_RX=1), with CRC 1 byte
-	nrf24_write_register(NRF24_REG_CONFIG, 0b00001011);
+    /* Begin transmission every 5 seconds */
 
-	// POWER DOWN to STANDBY takes 1.5ms
-	_delay_ms(3);
-
-	// Enable data pipe 0
-	nrf24_write_register(NRF24_REG_EN_RXADDR, 0x01);
-
-	// Disable auto acknowledgement on all pipes (for compatibility with NRF24)
-	nrf24_write_register(NRF24_REG_EN_AA, 0x00);
-
-	// Disable retransmissions
-	nrf24_write_register(NRF24_REG_SETUP_RETR, 0x00);
-
-	// Set 1mbps, -18dBm
-	nrf24_write_register(NRF24_REG_RF_SETUP, 0b00000000);
-
-	// Set 2416MHz
-	nrf24_write_register(NRF24_REG_RF_CH, 0x10);
-
-	// Disable features
-	nrf24_write_register(NRF24_REG_FEATURE, 0x00);
-
-	// Disable dynamic payload for everything
-	nrf24_write_register(NRF24_REG_DYNPD, 0x00);
-
-	// Set address length of 5 bytes
-	nrf24_write_register(NRF24_REG_SETUP_AW, 0x03);
-
-	// Set address
-	nrf24_write_register_n(NRF24_REG_RX_ADDR_P0, RX_ADDRESS, 5);
-
-	// Set payload width (32 bytes) (for compatibility with NRF24)
-	nrf24_write_register(NRF24_REG_RX_PW_P0, 0b00100000);
-
-	_delay_us(500);
-	PORTB |= (1<<PB1);
-	_delay_us(500);
-    }
-
-    lcd_show2("WAITING...");
-
-    // Loop for a packet and display it
-    // Receive loop:
-    char status;
-    char buf[32];
     while (1) {
-	// poll RX_DR from STATUS (if high means data received)
-	status = nrf24_read_register(NRF24_REG_STATUS);
+	lcd_clear_and_home();
 
-	if ((status & 0x40) == 0) {
-	    _delay_ms(1000);
-	    continue;
+	/* Prepare and write */
+	nrf24_send_command(NRF24_CMD_W_REGISTER | NRF24_REG_TX_ADDR, SERVER_ADDR, 5, 0, 0);
+	nrf24_send_command(NRF24_CMD_W_TX_PAYLOAD, MSG, 5, 0, 0);
+	NRF24_SPI_PORT |= (1<<NRF24_PIN_CE);
+	_delay_us(20); /* Hold for at least 10us to trigger TX */
+
+	/* Wait for settling mode for at least 130us */
+	_delay_us(200);
+
+	/* Wait a bit longer for the transaction to go through */
+	/* This should be higher than the worst-case scenario of auto-retries */
+	_delay_ms(4);
+
+	/* Back to standby-I and print status */
+	NRF24_SPI_PORT &= ~(1<<NRF24_PIN_CE);
+
+	_delay_ms(1);
+	nrf24_send_command(NRF24_CMD_R_REGISTER | NRF24_REG_STATUS, 0, 0, &status, 1);
+
+	lcd_print_text("STATUS=");
+	lcd_print_byte(status);
+	lcd_move_second_line();
+
+	/* If MAX_RT is asserted it means TX failed. Clear the flag */
+	if (status & (1<<4)) {
+	    status |= (1<<4); /* We clear by writing 1 */
+	    nrf24_send_command(NRF24_CMD_W_REGISTER | NRF24_REG_STATUS, &status, 1, 0, 0);
+	    show_error("TX FAILED");
+
+	/* If TX_DS is up it means we've successfully sent the packet */
+	} else if (status & (1<<5)) {
+
+	    status |= (1<<5); /* We clear by writing 1 */
+	    nrf24_send_command(NRF24_CMD_W_REGISTER | NRF24_REG_STATUS, &status, 1, 0, 0);
+
+	    /* Check that we've received an ACK payload */
+	    if (status & (1<<6)) {
+		status |= (1<<6); /* We clear by writing 1 */
+		nrf24_send_command(NRF24_CMD_W_REGISTER | NRF24_REG_STATUS, &status, 1, 0, 0);
+
+		/* Get the length of the ack payload. */
+		nrf24_send_command(NRF24_CMD_R_RX_PL_WID, 0, 0, &buf, 1);
+
+		/* Read the payload and show it*/
+		nrf24_send_command(NRF24_CMD_R_RX_PAYLOAD, 0, 0, recv, buf);
+
+		recv[buf] = '\0';
+		lcd_show_text(recv);
+	    } else {
+		show_error("NO PAYLOAD");
+	    }
+	} else {
+	    show_error("MSG NOT SENT");
 	}
 
-	// Wait and make CE low (to go to standby I)
-	PORTB &= ~(1<<PB1);
-
-	// Read the payload and display it
-	nrf24_read_rx_payload(buf, 32);
-	lcd_show2(buf);
-
-	// clear the status
-	nrf24_write_register(NRF24_REG_STATUS, (status | 0x20));
-
-	// Go back to RX mode
-	PORTB |= (1<<PB1);
-	_delay_us(500);
+	/* Wait before next transmission */
+	_delay_ms(1000);
+	nrf24_send_command(NRF24_CMD_FLUSH_TX, 0, 0, 0, 0);
     }
 
     return 1;
 }
 
-void nrf24_write_register(char addr, char data)
-{
-    // Pull CSN low
-    PORTB &= ~(1<<PB2);
-    _delay_us(1);
-
-    // Write command
-    SPDR = 0x20 | addr;
-    while(!(SPSR & (1<<SPIF)));
-
-    // Send data
-    SPDR = data;
-    while(!(SPSR & (1<<SPIF)));
-
-    // Pull CSN high again
-    PORTB |= (1<<PB2);
-    _delay_us(1);
-}
-
-void nrf24_write_register_n(char addr, char* data, int len)
-{
-    // Pull CSN low
-    PORTB &= ~(1<<PB2);
-    _delay_us(1);
-
-    // Write command
-    SPDR = 0x20 | addr;
-    while(!(SPSR & (1<<SPIF)));
-
-    // Send data
-    for(int i = 0; i < len; i++)
-    {
-	SPDR = data[i];
-	while(!(SPSR & (1<<SPIF)));
-    }
-
-    // Pull CSN high again
-    PORTB |= (1<<PB2);
-    _delay_us(1);
-}
-
-void nrf24_read_rx_payload(char* buf, int len)
-{
-    // Pull CSN low
-    PORTB &= ~(1<<PB2);
-    _delay_us(1);
-
-    // Write R_RX_PAYLOAD
-    SPDR = 0x61;
-    while(!(SPSR & (1<<SPIF)));
-
-    for(int i = 0; i<len; i++)
-    {
-	// Read byte
-	SPDR = 0xFF;
-	while(!(SPSR & (1<<SPIF)));
-
-	buf[i] = SPDR;
-    }
-
-    // Pull CSN high again
-    PORTB |= (1<<PB2);
-    _delay_us(1);
-}
-
-char nrf24_read_payload_width(void)
-{
-    char data = 0;
-
-    // Pull CSN high and wait a bit
-    PORTB |= (1<<PB2);
-    _delay_us(500);
-
-    PORTB &= ~(1<<PB2);
-    _delay_us(1);
-
-    // Write R_RX_PL_WID command (0110 0000)
-    SPDR = 0x60;
-    while(!(SPSR & (1<<SPIF)));
-
-    // Write a NOP to read the contents
-    SPDR = 0xFF;
-    while(!(SPSR & (1<<SPIF)));
-    PORTB |= (1<<PB2);
-    _delay_us(1);
-
-    data = SPDR;
-    return data;
-}
-char nrf24_read_register(char addr)
-{
-    char data = 0;
-
-    // Pull CSN high and wait a bit
-    PORTB |= (1<<PB2);
-    _delay_us(500);
-
-    PORTB &= ~(1<<PB2);
-    _delay_us(1);
-
-    // Write read command (000A AAAA)
-    SPDR = 0x00 | addr;
-    while(!(SPSR & (1<<SPIF)));
-
-    // Write a NOP to read the contents
-    SPDR = 0xFF;
-    while(!(SPSR & (1<<SPIF)));
-    PORTB |= (1<<PB2);
-    _delay_us(1);
-
-    data = SPDR;
-    return data;
-}
-
-void init(void)
-{
-    /* Set all port D as output (lcd port) */
-    DDRD = 0xFF;
-    PORTD = 0x00;
-
-    // Configure PORTB for SPI (master)
-    // MOSI is PB3 and SCK is PB5, ^SS is PB2. CE is PB1
-    DDRB = (1<<PB5) | (1<<PB3) | (1<<PB2) | (1<<PB1);
-
-    // Configure SPI as Master and fck/16
-    SPCR = (1<<SPE) | (1<<MSTR) | (1<<SPR0);
-
-    /* Set all other ports as input with pull-up resistors */
-    DDRC = 0; PORTC = 0xFF;
-
-    /* NOP used for synchronization */
-    _NOP();
+void show_error(const char* err) {
+    lcd_show_lines("[ERROR]", err);
 }
