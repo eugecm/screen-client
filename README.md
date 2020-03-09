@@ -3,7 +3,7 @@
 ![](schematic.png?raw=true)
 ![](shot.jpg?raw=true)
 
-This if the firmware for a device that displays information received
+This is the firmware for a device that displays information received
 from `screen-server` (not yet pushed).  Written for ATmega 328 but it
 doesn't use any fancy features so it should be easy to make it work
 with other AVR chips, as long as the pins are configured correctly and
